@@ -1,0 +1,27 @@
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and local data
+.env
+*.env
+!.env.example
+server/.env
+server/storage/
+
+# Node / Electron
+node_modules/
+web/out/
+web/release/
+dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
