@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class HealthResponse(BaseModel):
@@ -12,10 +12,12 @@ class HealthResponse(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     provider: str = "anthropic"
-    api_key: str | None = None
-    base_url: str | None = None
-    model_id: str | None = None
+    api_key: str | None = Field(default=None, validation_alias=AliasChoices("api_key", "apiKey"))
+    base_url: str | None = Field(default=None, validation_alias=AliasChoices("base_url", "baseUrl"))
+    model_id: str | None = Field(default=None, validation_alias=AliasChoices("model_id", "modelId"))
     temperature: float = 0.1
 
 

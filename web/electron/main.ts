@@ -43,11 +43,24 @@ function normalizeSettings() {
 }
 
 function createWindow(): void {
+  const useCustomTitleBarOverlay = process.platform !== 'darwin'
+
   const win = new BrowserWindow({
     width: 1480,
     height: 960,
     minWidth: 1200,
     minHeight: 800,
+    autoHideMenuBar: true,
+    ...(useCustomTitleBarOverlay
+      ? {
+          titleBarStyle: 'hidden' as const,
+          titleBarOverlay: {
+            color: '#111827',
+            symbolColor: '#9CA3AF',
+            height: 32
+          }
+        }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.cjs'),
       contextIsolation: true,

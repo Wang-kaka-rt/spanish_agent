@@ -7,6 +7,7 @@ from app.models.db_models import CachedLaw, ContractTemplate
 from app.routers import chat as chat_router
 from app.routers import contracts as contracts_router
 from app.routers import health as health_router
+from app.schemas.schemas import ModelConfig
 
 
 @pytest.mark.asyncio
@@ -58,8 +59,8 @@ async def test_health_and_contract_generate_endpoints(db_session):
                 "order_input": "客户王芳，NIE: Y9876543B，服务：家庭团聚居留，费用：1900欧。",
                 "model_config": {
                     "provider": "local",
-                    "base_url": "",
-                    "model_id": "test-model",
+                    "baseUrl": "",
+                    "modelId": "test-model",
                     "temperature": 0.1,
                 },
             },
@@ -68,6 +69,12 @@ async def test_health_and_contract_generate_endpoints(db_session):
         payload = response.json()
         assert payload["title"] == "Contrato API"
         assert "PRIMERA. Partes" in payload["generated_text"]
+
+        preview_response = await client.get(f"/api/contracts/{payload['id']}/preview/docx")
+        assert preview_response.status_code == 200
+        assert preview_response.headers["content-type"].startswith(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
 
 
 @pytest.mark.asyncio
@@ -91,3 +98,21 @@ async def test_chat_session_endpoints(db_session):
         sessions = list_response.json()
         assert len(sessions) == 1
         assert sessions[0]["id"] == session_payload["id"]
+
+
+def test_model_config_accepts_camel_case_fields():
+    config = ModelConfig.model_validate(
+        {
+            "provider": "openai_compatible",
+            "apiKey": "sk-test",
+            "baseUrl": "https://api.deepseek.com",
+            "modelId": "deepseek-chat",
+            "temperature": 0.2,
+        }
+    )
+
+    assert config.provider == "openai_compatible"
+    assert config.api_key == "sk-test"
+    assert config.base_url == "https://api.deepseek.com"
+    assert config.model_id == "deepseek-chat"
+    assert config.temperature == 0.2

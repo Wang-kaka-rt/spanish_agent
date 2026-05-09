@@ -1,10 +1,16 @@
 import html
+import json
 import re
 import shutil
+from collections.abc import AsyncGenerator
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
 from docx import Document
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,12 +34,6 @@ except Exception:  # pragma: no cover
 
 settings = get_settings()
 
-LAW_HINTS = {
-    "reagrup": [{"boe_id": "BOE-A-2000-544", "title": "Ley Organica 4/2000", "category": "extranjeria"}],
-    "estudio": [{"boe_id": "BOE-A-2011-7703", "title": "RD 557/2011", "category": "extranjeria"}],
-    "residencia": [{"boe_id": "BOE-A-2011-7703", "title": "RD 557/2011", "category": "extranjeria"}],
-    "mercantil": [{"boe_id": "BOE-A-1889-4763", "title": "Codigo Civil", "category": "civil"}],
-}
 MAX_GENERATION_ATTEMPTS = 3
 
 
@@ -95,6 +95,96 @@ class ContractService:
         await db.refresh(contract)
         return contract
 
+    async def generate_stream(
+        self, db: AsyncSession, payload: ContractGenerateRequest
+    ) -> AsyncGenerator[str, None]:
+        def sse(data: dict) -> str:
+            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        state: WorkflowState = {
+            "db": db,
+            "title": payload.title,
+            "order_input": payload.order_input,
+            "model_config": payload.llm_config,
+            "extracted_fields": {},
+            "selected_template_id": None,
+            "template": None,
+            "laws": [],
+            "generated_text": "",
+            "validation_errors": [],
+            "generation_attempts": 0,
+        }
+
+        try:
+            yield sse({"type": "step", "step": "extract_fields", "status": "running"})
+            state = await self._extract_fields_node(state)
+            yield sse({"type": "step", "step": "extract_fields", "status": "done",
+                       "data": {"fields": state["extracted_fields"]}})
+
+            yield sse({"type": "step", "step": "select_template", "status": "running"})
+            state = await self._select_template_node(state)
+            template_hint = state["selected_template_id"] or ""
+            yield sse({"type": "step", "step": "select_template", "status": "done",
+                       "data": {"template_id": template_hint}})
+
+            yield sse({"type": "step", "step": "load_template", "status": "running"})
+            state = await self._load_template_node(state)
+            template_title = state["template"].title if state["template"] else ""
+            yield sse({"type": "step", "step": "load_template", "status": "done",
+                       "data": {"template_title": template_title}})
+
+            yield sse({"type": "step", "step": "fetch_laws", "status": "running"})
+            state = await self._fetch_laws_node(state)
+            yield sse({"type": "step", "step": "fetch_laws", "status": "done",
+                       "data": {"laws": [{"boe_id": l["boe_id"], "title": l["title"]} for l in state["laws"]]}})
+
+            attempt = 0
+            while True:
+                attempt += 1
+                yield sse({"type": "step", "step": "generate_contract", "status": "running",
+                           "data": {"attempt": attempt}})
+                state = await self._generate_contract_node(state)
+                yield sse({"type": "step", "step": "generate_contract", "status": "done"})
+
+                yield sse({"type": "step", "step": "validate_contract", "status": "running"})
+                state = await self._validate_contract_node(state)
+                if state["validation_errors"] and state["generation_attempts"] < MAX_GENERATION_ATTEMPTS:
+                    yield sse({"type": "step", "step": "validate_contract", "status": "retrying",
+                               "data": {"errors": state["validation_errors"]}})
+                    continue
+                break
+
+            if state["validation_errors"]:
+                yield sse({"type": "step", "step": "validate_contract", "status": "error",
+                           "data": {"errors": state["validation_errors"]}})
+            else:
+                yield sse({"type": "step", "step": "validate_contract", "status": "done"})
+
+            template = state["template"]
+            if template is None:
+                yield sse({"type": "error", "message": "Template selection failed"})
+                return
+
+            contract = Contract(
+                title=payload.title or f"Contrato {template.title}",
+                template_id=template.id,
+                order_input=payload.order_input,
+                extracted_fields=state["extracted_fields"],
+                generated_text=state["generated_text"],
+                laws_used=self._serialize_laws(state["laws"]),
+                status="draft",
+            )
+            db.add(contract)
+            await db.commit()
+            await db.refresh(contract)
+
+            from app.schemas.schemas import ContractRead
+            contract_data = ContractRead.model_validate(contract).model_dump(mode="json")
+            yield sse({"type": "done", "contract": contract_data})
+
+        except Exception as e:
+            yield sse({"type": "error", "message": str(e)})
+
     async def list_contracts(self, db: AsyncSession) -> list[Contract]:
         result = await db.scalars(select(Contract).order_by(Contract.created_at.desc()))
         return list(result.all())
@@ -125,10 +215,34 @@ class ContractService:
 
     async def export_docx(self, db: AsyncSession, contract_id: str) -> Path:
         contract = await self.get_contract(db, contract_id)
+        file_path = await self._build_docx_file(db, contract, exported=True)
+
+        contract.export_docx_path = str(file_path)
+        contract.status = "exported"
+        await db.commit()
+        return file_path
+
+    async def preview_docx(self, db: AsyncSession, contract_id: str) -> Path:
+        contract = await self.get_contract(db, contract_id)
+        return await self._build_docx_file(db, contract, exported=False)
+
+    async def _build_docx_file(self, db: AsyncSession, contract: Contract, exported: bool) -> Path:
         export_dir = settings.exports_dir / contract.id
         export_dir.mkdir(parents=True, exist_ok=True)
-        file_path = export_dir / "contract.docx"
+        file_path = export_dir / ("contract.docx" if exported else "preview.docx")
 
+        template_source = await self._resolve_template_docx_path(db, contract)
+        if template_source is not None:
+            try:
+                self._render_contract_into_template(template_source, file_path, contract)
+                return file_path
+            except Exception:
+                pass
+
+        self._render_plain_docx(file_path, contract)
+        return file_path
+
+    def _render_plain_docx(self, file_path: Path, contract: Contract) -> None:
         document = Document()
         document.add_heading(contract.title, level=1)
         for paragraph in (contract.generated_text or "").split("\n\n"):
@@ -136,11 +250,6 @@ class ContractService:
             if clean:
                 document.add_paragraph(clean)
         document.save(file_path)
-
-        contract.export_docx_path = str(file_path)
-        contract.status = "exported"
-        await db.commit()
-        return file_path
 
     async def export_pdf(self, db: AsyncSession, contract_id: str) -> Path:
         contract = await self.get_contract(db, contract_id)
@@ -183,19 +292,31 @@ class ContractService:
 
         return fields
 
-    async def _select_template(self, db: AsyncSession, order_input: str) -> ContractTemplate:
+    async def _select_template(
+        self, db: AsyncSession, order_input: str, model_config: ModelConfig
+    ) -> ContractTemplate:
         result = await db.scalars(select(ContractTemplate).where(ContractTemplate.is_active.is_(True)))
         templates = list(result.all())
         if not templates:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active templates available")
 
+        template_options = [
+            {"id": t.id, "title": t.title, "category": t.category or "", "subcategory": t.subcategory or ""}
+            for t in templates
+        ]
+        ai_id = await self.ai_service.select_template(order_input, template_options, model_config)
+        if ai_id:
+            match = next((t for t in templates if t.id == ai_id), None)
+            if match:
+                return match
+
+        # Fallback: keyword scoring
         order_lower = order_input.lower()
         scored: list[tuple[int, ContractTemplate]] = []
         for template in templates:
             haystack = " ".join(filter(None, [template.title, template.category, template.subcategory or ""])).lower()
             score = sum(1 for token in order_lower.split() if len(token) > 3 and token in haystack)
             scored.append((score, template))
-
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
 
@@ -205,34 +326,65 @@ class ContractService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
         return template
 
-    async def _resolve_laws(self, db: AsyncSession, order_input: str) -> list[dict[str, str]]:
-        order_lower = order_input.lower()
-        candidates: list[dict[str, str]] = []
-        for keyword, laws in LAW_HINTS.items():
-            if keyword in order_lower:
-                candidates.extend(laws)
-        if not candidates:
-            candidates = [{"boe_id": "BOE-A-1889-4763", "title": "Codigo Civil", "category": "civil"}]
+    async def _resolve_laws(self, db: AsyncSession, order_input: str, model_config: ModelConfig) -> list[dict[str, str]]:
+        # Extract Latin-script words (5+ chars) as BOE search terms, skip common stopwords
+        _STOP = {"para", "como", "esta", "este", "sobre", "entre", "hasta", "desde", "todos", "todas"}
+        latin_tokens = [
+            w.lower() for w in re.findall(r"[a-zA-ZáéíóúñüÁÉÍÓÚÑÜ]{5,}", order_input)
+            if w.lower() not in _STOP
+        ]
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        search_terms: list[str] = []
+        for t in latin_tokens:
+            if t not in seen:
+                seen.add(t)
+                search_terms.append(t)
+        search_terms = search_terms[:4]
 
-        resolved: list[dict[str, str]] = []
-        for candidate in candidates:
-            existing = await db.scalar(select(CachedLaw).where(CachedLaw.boe_id == candidate["boe_id"]))
-            if existing:
-                resolved.append({"boe_id": existing.boe_id, "title": existing.title, "raw_text": existing.raw_text})
-                continue
+        # Search BOE online for each term and fetch+cache results
+        for term in search_terms:
             try:
-                law = await self.boe_service.fetch_and_cache(
-                    db,
-                    boe_id=candidate["boe_id"],
-                    title=candidate["title"],
-                    category=candidate.get("category"),
-                )
-                resolved.append({"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text})
+                boe_results = await self.boe_service.search(term)
+                for r in boe_results[:2]:
+                    try:
+                        await self.boe_service.fetch_and_cache(
+                            db,
+                            boe_id=r["boe_id"],
+                            title=r.get("title"),
+                            source_url=r.get("source_url"),
+                        )
+                    except Exception:
+                        pass
             except Exception:
-                resolved.append({"boe_id": candidate["boe_id"], "title": candidate["title"], "raw_text": ""})
+                pass
 
-        unique: dict[str, dict[str, str]] = {item["boe_id"]: item for item in resolved}
-        return list(unique.values())
+        # Re-query all cached laws (includes newly fetched ones)
+        result = await db.scalars(select(CachedLaw))
+        all_laws = list(result.all())
+
+        if not all_laws:
+            return []
+
+        # Ask AI to select the most relevant laws
+        candidates = [{"boe_id": law.boe_id, "title": law.title} for law in all_laws]
+        ai_ids = await self.ai_service.select_laws(order_input, candidates, model_config)
+        if ai_ids:
+            id_set = set(ai_ids)
+            ai_laws = [law for law in all_laws if law.boe_id in id_set]
+            if ai_laws:
+                return [{"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text or ""} for law in ai_laws[:5]]
+
+        # Fallback: keyword scoring
+        order_tokens = {w.lower() for w in re.findall(r"[a-zA-ZáéíóúñüÁÉÍÓÚÑÜ]{4,}", order_input)}
+        scored: list[tuple[int, CachedLaw]] = []
+        for law in all_laws:
+            haystack = " ".join(filter(None, [law.title, law.boe_id, law.category or ""])).lower()
+            score = sum(1 for token in order_tokens if token in haystack)
+            scored.append((score, law))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        relevant = [law for score, law in scored if score > 0] or [law for _, law in scored[:3]]
+        return [{"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text or ""} for law in relevant[:5]]
 
     async def _generate_contract_text(
         self,
@@ -303,6 +455,158 @@ class ContractService:
     def _serialize_laws(self, laws: list[dict[str, str]]) -> list[dict[str, str]]:
         return [{"boe_id": law["boe_id"], "title": law["title"]} for law in laws]
 
+    async def _resolve_template_docx_path(self, db: AsyncSession, contract: Contract) -> Path | None:
+        if not contract.template_id:
+            return None
+
+        template = await db.get(ContractTemplate, contract.template_id)
+        if template is None or not template.file_path:
+            return None
+
+        file_path = Path(template.file_path)
+        if not file_path.is_absolute():
+            file_path = Path.cwd() / file_path
+        if file_path.suffix.lower() != ".docx" or not file_path.exists() or not file_path.is_file():
+            return None
+        return file_path
+
+    def _render_contract_into_template(self, template_path: Path, output_path: Path, contract: Contract) -> None:
+        document = Document(template_path)
+        body_start = self._find_template_body_start(document)
+        if body_start is None:
+            self._render_plain_docx(output_path, contract)
+            return
+
+        self._refresh_template_date_line(document, contract, body_start)
+        style_samples = self._collect_template_style_samples(document, body_start)
+        anchor = document.paragraphs[body_start - 1] if body_start > 0 else None
+        body_paragraphs = list(document.paragraphs[body_start:])
+        for paragraph in body_paragraphs:
+            if self._paragraph_contains_drawing(paragraph):
+                anchor = paragraph
+                continue
+            self._delete_paragraph(paragraph)
+
+        blocks = self._split_contract_blocks(contract.generated_text or "")
+        for block in blocks:
+            sample = self._select_style_sample(block, style_samples)
+            new_paragraph = self._append_paragraph_after(document, anchor)
+            self._apply_paragraph_format(sample, new_paragraph)
+            self._set_paragraph_text(new_paragraph, block, sample)
+            anchor = new_paragraph
+
+        document.save(output_path)
+
+    def _find_template_body_start(self, document: Document) -> int | None:
+        markers = ("REUNIDOS", "EXPONEN", "CLÁUSULAS", "CLAUSULAS", "PRIMERA", "SEGUNDA")
+        for index, paragraph in enumerate(document.paragraphs):
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            upper = text.upper()
+            if any(marker in upper for marker in markers):
+                return index
+
+        for index, paragraph in enumerate(document.paragraphs):
+            text = paragraph.text.strip()
+            if text and len(text) > 40:
+                return index
+        return None
+
+    def _refresh_template_date_line(self, document: Document, contract: Contract, body_start: int) -> None:
+        date_text = self._build_contract_date_text(contract.extracted_fields.get("fecha"))
+        for paragraph in document.paragraphs[:body_start]:
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            if paragraph.alignment == 2 or text.lower().startswith("en "):
+                self._set_paragraph_text(paragraph, date_text, paragraph)
+                return
+
+    def _build_contract_date_text(self, raw_date: Any) -> str:
+        if isinstance(raw_date, str) and raw_date.strip():
+            cleaned = raw_date.strip()
+            if cleaned.lower().startswith("en "):
+                return cleaned
+            return f"En Madrid, a {cleaned}."
+
+        now = datetime.now()
+        return f"En Madrid, a {now.day:02d} de {now.month:02d} de {now.year}."
+
+    def _collect_template_style_samples(self, document: Document, body_start: int) -> dict[str, Paragraph]:
+        samples: dict[str, Paragraph] = {}
+        body_paragraphs = [paragraph for paragraph in document.paragraphs[body_start:] if paragraph.text.strip()]
+        if not body_paragraphs:
+            fallback = next((paragraph for paragraph in document.paragraphs if paragraph.text.strip()), document.paragraphs[0])
+            return {"body": fallback, "section": fallback, "centered": fallback}
+
+        samples["body"] = next((p for p in body_paragraphs if len(p.text.strip()) > 40), body_paragraphs[0])
+        samples["section"] = next((p for p in body_paragraphs if self._looks_like_section_heading(p.text.strip())), samples["body"])
+        samples["centered"] = next(
+            (p for p in body_paragraphs if p.alignment == 1 and len(p.text.strip()) <= 40),
+            samples["section"],
+        )
+        return samples
+
+    def _split_contract_blocks(self, text: str) -> list[str]:
+        normalized = text.replace("\r\n", "\n").strip()
+        if not normalized:
+            return []
+
+        blocks: list[str] = []
+        for chunk in re.split(r"\n\s*\n+", normalized):
+            lines = [line.strip() for line in chunk.split("\n") if line.strip()]
+            blocks.extend(lines)
+        return blocks
+
+    def _select_style_sample(self, block: str, samples: dict[str, Paragraph]) -> Paragraph:
+        if self._looks_like_centered_heading(block):
+            return samples["centered"]
+        if self._looks_like_section_heading(block):
+            return samples["section"]
+        return samples["body"]
+
+    def _looks_like_centered_heading(self, text: str) -> bool:
+        normalized = text.strip()
+        return bool(normalized) and len(normalized) <= 40 and normalized == normalized.upper()
+
+    def _looks_like_section_heading(self, text: str) -> bool:
+        normalized = text.strip().upper()
+        return bool(
+            re.match(
+                r"^(PRIMERA|SEGUNDA|TERCERA|CUARTA|QUINTA|SEXTA|SEPTIMA|S[EÉ]PTIMA|OCTAVA|NOVENA|D[EÉ]CIMA|UND[EÉ]CIMA|DUOD[EÉ]CIMA|DECIMOTERCERA)",
+                normalized,
+            )
+        )
+
+    def _append_paragraph_after(self, document: Document, anchor: Paragraph | None) -> Paragraph:
+        if anchor is None:
+            return document.add_paragraph()
+        paragraph = document.add_paragraph()
+        anchor._p.addnext(paragraph._p)
+        return paragraph
+
+    def _apply_paragraph_format(self, source: Paragraph, target: Paragraph) -> None:
+        if source._p.pPr is not None:
+            target._p.insert(0, deepcopy(source._p.pPr))
+
+    def _set_paragraph_text(self, paragraph: Paragraph, text: str, sample: Paragraph) -> None:
+        for child in list(paragraph._p):
+            if child.tag != qn("w:pPr"):
+                paragraph._p.remove(child)
+        run = paragraph.add_run(text)
+        if sample.runs and sample.runs[0]._element.rPr is not None:
+            run._element.insert(0, deepcopy(sample.runs[0]._element.rPr))
+
+    def _paragraph_contains_drawing(self, paragraph: Paragraph) -> bool:
+        return bool(paragraph._p.xpath(".//*[local-name()='drawing' or local-name()='pict']"))
+
+    def _delete_paragraph(self, paragraph: Paragraph) -> None:
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
     async def _run_workflow(self, state: WorkflowState) -> WorkflowState:
         if self.graph is not None:
             return await self.graph.ainvoke(state)
@@ -352,7 +656,7 @@ class ContractService:
         return state
 
     async def _select_template_node(self, state: WorkflowState) -> WorkflowState:
-        template = await self._select_template(state["db"], state["order_input"])
+        template = await self._select_template(state["db"], state["order_input"], state["model_config"])
         state["selected_template_id"] = template.id
         return state
 
@@ -364,7 +668,7 @@ class ContractService:
         return state
 
     async def _fetch_laws_node(self, state: WorkflowState) -> WorkflowState:
-        state["laws"] = await self._resolve_laws(state["db"], state["order_input"])
+        state["laws"] = await self._resolve_laws(state["db"], state["order_input"], state["model_config"])
         return state
 
     async def _generate_contract_node(self, state: WorkflowState) -> WorkflowState:

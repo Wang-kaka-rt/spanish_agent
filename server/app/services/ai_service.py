@@ -7,6 +7,8 @@ import httpx
 
 from app.schemas.schemas import ModelConfig
 
+MODEL_REQUEST_TIMEOUT_SECONDS = 180.0
+
 
 class AIService:
     async def extract_fields(self, order_input: str, model_config: ModelConfig) -> dict[str, str] | None:
@@ -38,8 +40,15 @@ class AIService:
         )
         system_prompt = (
             "You are a Spanish legal contract drafting assistant. "
-            "Draft a complete hoja de encargo in Spanish with clear sections such as PRIMERA, SEGUNDA, TERCERA, "
-            "CUARTA and QUINTA. Keep the wording formal and practical."
+            "Draft a complete hoja de encargo in Spanish using the selected template only as a reference for structure, "
+            "tone, section ordering, and clause style. The final contract must be newly drafted from the order data and "
+            "the provided legal materials. Never copy personal data, company data, IDs, addresses, phones, emails, or "
+            "sample facts from the template unless they also appear in the extracted order fields. If the template "
+            "contains sample names or example clauses, treat them as examples only and replace them with the actual "
+            "order facts. Preserve the template's overall document rhythm as much as possible, including the high-level "
+            "order of introductory headings and the sequence of clauses, while rewriting the substance for the current "
+            "matter. Produce a formal, practical, standalone Spanish contract with clear sections such as PRIMERA, "
+            "SEGUNDA, TERCERA, CUARTA and QUINTA."
         )
         user_prompt = (
             f"Order input:\n{order_input}\n\n"
@@ -47,7 +56,13 @@ class AIService:
             f"Selected template title:\n{template_title}\n\n"
             f"Selected template text:\n{template_text[:4000]}\n\n"
             f"Relevant laws:\n{law_context[:5000]}\n\n"
-            "Generate the final Spanish contract text only."
+            "Instructions:\n"
+            "- Use the template as a style and structure reference, not as data to copy.\n"
+            "- Use the extracted fields and order input as the authoritative source of party data and service details.\n"
+            "- If some information is missing, write neutral professional wording and avoid inventing specific IDs, "
+            "addresses, emails, phone numbers, registration numbers, or names.\n"
+            "- Incorporate the legal context where useful, but do not quote long raw law passages unless necessary.\n"
+            "- Return only the final Spanish contract text.\n"
         )
         return await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=2200)
 
@@ -181,7 +196,7 @@ class AIService:
             "stream": True,
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -201,7 +216,7 @@ class AIService:
         if not model_config.base_url:
             return
 
-        base_url = model_config.base_url.rstrip("/")
+        base_url = self._normalize_openai_base_url(model_config.base_url)
         url = f"{base_url}/chat/completions"
         headers = {"content-type": "application/json"}
         if model_config.api_key:
@@ -218,7 +233,7 @@ class AIService:
             ],
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -253,7 +268,7 @@ class AIService:
             "messages": [{"role": "user", "content": user_prompt}],
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
             data = response.json()
@@ -262,6 +277,68 @@ class AIService:
             return "\n".join(texts).strip() or None
         except Exception:
             return None
+
+    async def _test_connection(self, model_config: ModelConfig) -> str:
+        """Make a minimal API call and return the response text, raising on any failure."""
+        provider = (model_config.provider or "").strip().lower()
+        system_prompt = "You are a test assistant."
+        user_prompt = "Reply with exactly: OK"
+
+        if provider == "anthropic":
+            if not model_config.api_key:
+                raise ValueError("API Key 未填写")
+            base_url = (model_config.base_url or "https://api.anthropic.com").rstrip("/")
+            url = f"{base_url}/v1/messages"
+            headers = {
+                "content-type": "application/json",
+                "x-api-key": model_config.api_key,
+                "anthropic-version": "2023-06-01",
+            }
+            payload = {
+                "model": model_config.model_id or "claude-3-5-sonnet-20241022",
+                "max_tokens": 10,
+                "temperature": 0,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+            data = response.json()
+            parts = data.get("content", [])
+            return "\n".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+
+        if provider in {"openai_compatible", "local"}:
+            if not model_config.base_url:
+                raise ValueError("Base URL 未填写")
+            base_url = self._normalize_openai_base_url(model_config.base_url)
+            url = f"{base_url}/chat/completions"
+            headers: dict[str, str] = {"content-type": "application/json"}
+            if model_config.api_key:
+                headers["authorization"] = f"Bearer {model_config.api_key}"
+            payload = {
+                "model": model_config.model_id or "deepseek-chat",
+                "max_tokens": 10,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"].strip()
+
+        raise ValueError(f"未知 Provider 类型: {provider!r}")
+
+    def _normalize_openai_base_url(self, base_url: str) -> str:
+        """Ensure the base URL ends with /v1 so /chat/completions resolves correctly."""
+        url = base_url.rstrip("/")
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        return url
 
     async def _complete_openai_compatible(
         self,
@@ -273,7 +350,7 @@ class AIService:
         if not model_config.base_url:
             return None
 
-        base_url = model_config.base_url.rstrip("/")
+        base_url = self._normalize_openai_base_url(model_config.base_url)
         url = f"{base_url}/chat/completions"
         headers = {"content-type": "application/json"}
         if model_config.api_key:
@@ -289,13 +366,78 @@ class AIService:
             ],
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"].strip() or None
         except Exception:
             return None
+
+    async def select_template(
+        self,
+        order_input: str,
+        templates: list[dict[str, str]],
+        model_config: ModelConfig,
+    ) -> str | None:
+        """Return the template_id best matching the order, or None on failure."""
+        options = "\n".join(
+            f"- id:{t['id']} | title:{t['title']} | category:{t.get('category', '')} | sub:{t.get('subcategory', '')}"
+            for t in templates
+        )
+        system_prompt = (
+            "You are a Spanish legal assistant. Select the single most appropriate contract template "
+            "for the given order. Return strict JSON only."
+        )
+        user_prompt = (
+            f"Order:\n{order_input}\n\n"
+            f"Available templates:\n{options}\n\n"
+            'Return JSON: {"template_id": "<exact id value>"}'
+        )
+        response = await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=80)
+        if not response:
+            return None
+        parsed = self._parse_json_object(response)
+        return parsed.get("template_id") if parsed else None
+
+    async def select_laws(
+        self,
+        order_input: str,
+        candidates: list[dict[str, str]],
+        model_config: ModelConfig,
+    ) -> list[str]:
+        """Return list of boe_ids most relevant to the order."""
+        if not candidates:
+            return []
+        options = "\n".join(f"- {c['boe_id']}: {c['title']}" for c in candidates)
+        system_prompt = (
+            "You are a Spanish legal assistant. Select the most relevant laws for the given order. "
+            "Return strict JSON only."
+        )
+        user_prompt = (
+            f"Order:\n{order_input}\n\n"
+            f"Available laws:\n{options}\n\n"
+            'Return JSON: {"boe_ids": ["BOE-A-...", ...]}'
+        )
+        response = await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=200)
+        if not response:
+            return []
+        data = self._parse_json_raw(response)
+        if isinstance(data, dict):
+            ids = data.get("boe_ids", [])
+            if isinstance(ids, list):
+                return [str(i) for i in ids if i]
+        return []
+
+    def _parse_json_raw(self, value: str) -> Any:
+        for attempt in (value, value[value.find("{"):value.rfind("}") + 1] if "{" in value else ""):
+            if not attempt:
+                continue
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                pass
+        return None
 
     def _parse_json_object(self, value: str) -> dict[str, str] | None:
         try:

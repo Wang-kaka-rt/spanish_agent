@@ -18,6 +18,16 @@ function createClient(settings: AppSettings) {
 }
 
 export const api = {
+  async testModel(serverUrl: string, config: AppSettings['modelConfig']): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
+    const { data } = await axios.post(`${serverUrl}/api/ai/test`, {
+      provider: config.provider,
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      modelId: config.modelId,
+      temperature: config.temperature,
+    })
+    return data
+  },
   async health(settings: AppSettings) {
     const client = createClient(settings)
     const { data } = await client.get<HealthResponse>('/health')
@@ -73,7 +83,7 @@ export const api = {
   },
   async generateContract(settings: AppSettings, payload: { title?: string; order_input: string; model_config: AppSettings['modelConfig'] }) {
     const client = createClient(settings)
-    const { data } = await client.post<ContractItem>('/contracts/generate', payload)
+    const { data } = await client.post<ContractItem>('/contracts/generate', payload, { timeout: 300000 })
     return data
   },
   async listContracts(settings: AppSettings) {

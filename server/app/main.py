@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal, close_redis, init_db
-from app.routers import chat, contracts, health, laws, templates
+from app.routers import ai, chat, contracts, health, laws, templates
 from app.services.template_service import TemplateService
 
 settings = get_settings()
@@ -34,6 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(health.router, prefix=settings.api_prefix)
+app.include_router(ai.router, prefix=settings.api_prefix)
 app.include_router(templates.router, prefix=settings.api_prefix)
 app.include_router(laws.router, prefix=settings.api_prefix)
 app.include_router(contracts.router, prefix=settings.api_prefix)

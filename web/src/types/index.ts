@@ -57,6 +57,7 @@ export interface ContractItem {
   status: string
   export_docx_path?: string | null
   export_pdf_path?: string | null
+  created_at?: string | null
 }
 
 export interface ChatSessionItem {
