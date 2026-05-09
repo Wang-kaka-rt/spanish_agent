@@ -1,4 +1,4 @@
-.claude/
+/.claude/
 
 # Python
 __pycache__/
@@ -11,8 +11,13 @@ __pycache__/
 .env
 *.env
 !.env.example
+.venv/
+venv/
+server/.venv/
 server/.env
 server/storage/
+*.err.log
+*.out.log
 
 # Node / Electron
 node_modules/
