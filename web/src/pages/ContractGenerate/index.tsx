@@ -2,7 +2,7 @@ import Editor from '@monaco-editor/react'
 import {
   Bot, CheckCircle2, Copy, Download,
   FileText, Loader2, PanelRight, Plus, RefreshCw,
-  Save, Send, Sparkles, X, ZoomIn, ZoomOut,
+  Save, Search, Send, Sparkles, Trash2, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
@@ -37,6 +37,54 @@ interface FileMsg      { kind: 'file';      contract: ContractItem }
 interface ErrorMsg     { kind: 'error';     text: string }
 
 type GenMsg = UserMsg | AiMsg | ExtractedMsg | StepsMsg | FileMsg | ErrorMsg
+
+/* ── Session types ── */
+interface Session {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  messages: GenMsg[]
+  previewContractId: string | null
+}
+
+const STORAGE_KEY = 'spanish-agent-contract-sessions'
+const ACTIVE_KEY  = 'spanish-agent-contract-active'
+
+function loadSessions(): Session[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch { return [] }
+}
+
+function saveSessions(sessions: Session[]) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)) } catch { /* ignore */ }
+}
+
+function makeSession(): Session {
+  return {
+    id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title: '新会话',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messages: [],
+    previewContractId: null,
+  }
+}
+
+function formatDate(ts: number) {
+  const d = new Date(ts)
+  const now = new Date()
+  const diffMs = now.getTime() - d.getTime()
+  const diffDays = Math.floor(diffMs / 86400000)
+  if (diffDays === 0) return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  if (diffDays === 1) return '昨天'
+  if (diffDays < 7)  return `${diffDays} 天前`
+  return d.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+}
 
 function statusBadge(status: string) {
   switch (status) {
@@ -298,7 +346,6 @@ function PreviewDrawer({
     <aside className={`preview-drawer${open && contract ? ' open' : ' closed'}`}>
       {open && contract && (
         <>
-          {/* Header */}
           <div className="drawer-header">
             <div className="doc-icon"><span>DOC</span></div>
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -315,7 +362,6 @@ function PreviewDrawer({
             </button>
           </div>
 
-          {/* Toolbar */}
           <div className="drawer-toolbar">
             <div className="seg-btns">
               <button type="button" className={`seg-btn${tab === 'preview' ? ' active' : ''}`} onClick={() => setTab('preview')}>正文</button>
@@ -330,7 +376,6 @@ function PreviewDrawer({
             )}
           </div>
 
-          {/* Content */}
           {tab === 'preview' ? (
             <div className="drawer-doc-area">
               <div
@@ -346,7 +391,7 @@ function PreviewDrawer({
                 }}
               >
                 <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit', fontSize: 'inherit', lineHeight: 'inherit', margin: 0 }}>
-                  {contract.generated_text || '（合同正文为空，请点击「编辑」标签查看或在左侧重新生成）'}
+                  {contract.generated_text || '（合同正文为空）'}
                 </pre>
               </div>
               <div className="doc-page-num">— 第 1 页 —</div>
@@ -373,7 +418,6 @@ function PreviewDrawer({
             </div>
           )}
 
-          {/* Footer */}
           <div className="drawer-footer">
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: 'var(--gray-500)' }}>
               <CheckCircle2 size={12} style={{ color: 'var(--green-500)' }} />
@@ -400,22 +444,140 @@ function PreviewDrawer({
   )
 }
 
+/* ── Sessions Panel ── */
+function SessionsPanel({
+  sessions,
+  activeId,
+  onSelect,
+  onNew,
+  onDelete,
+}: {
+  sessions: Session[]
+  activeId: string
+  onSelect: (id: string) => void
+  onNew: () => void
+  onDelete: (id: string) => void
+}) {
+  const [search, setSearch] = useState('')
+  const [hoverId, setHoverId] = useState<string | null>(null)
+
+  const filtered = search.trim()
+    ? sessions.filter((s) => s.title.toLowerCase().includes(search.toLowerCase()))
+    : sessions
+
+  const previewText = (s: Session) => {
+    const userMsgs = s.messages.filter((m): m is UserMsg => m.kind === 'user')
+    return userMsgs.at(-1)?.text.slice(0, 60) || '暂无内容'
+  }
+
+  return (
+    <div className="sessions-panel">
+      <div className="sessions-panel-header">
+        <span className="sessions-panel-label">会话记录</span>
+        <button
+          type="button"
+          className="icon-btn"
+          onClick={onNew}
+          title="新建会话"
+          style={{ width: 26, height: 26 }}
+        >
+          <Plus size={14} />
+        </button>
+      </div>
+
+      <div className="sessions-search">
+        <div className="sessions-search-wrap">
+          <Search size={12} className="sessions-search-icon" />
+          <input
+            className="sessions-search-input"
+            placeholder="搜索会话…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+      </div>
+
+      <div className="sessions-list">
+        {filtered.length === 0 && (
+          <div style={{ padding: '20px 12px', textAlign: 'center', fontSize: 12, color: 'var(--gray-400)' }}>
+            {search ? '无匹配会话' : '暂无会话'}
+          </div>
+        )}
+        {filtered.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            className={`session-item${s.id === activeId ? ' active' : ''}`}
+            onClick={() => onSelect(s.id)}
+            onMouseEnter={() => setHoverId(s.id)}
+            onMouseLeave={() => setHoverId(null)}
+          >
+            <div className="session-item-top">
+              <span className="session-item-title">{s.title}</span>
+              {hoverId === s.id && s.id !== activeId ? (
+                <button
+                  type="button"
+                  style={{
+                    padding: 0, border: 'none', background: 'none',
+                    color: 'var(--gray-400)', cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', flexShrink: 0,
+                    height: 'auto',
+                  }}
+                  onClick={(e) => { e.stopPropagation(); onDelete(s.id) }}
+                  title="删除会话"
+                >
+                  <Trash2 size={12} />
+                </button>
+              ) : (
+                <span className="session-item-date">{formatDate(s.updatedAt)}</span>
+              )}
+            </div>
+            <div className="session-item-preview">{previewText(s)}</div>
+          </button>
+        ))}
+      </div>
+
+      <div className="sessions-footer">
+        <FileText size={12} />
+        <span>{sessions.length} 个会话</span>
+      </div>
+    </div>
+  )
+}
+
 /* ── Main page ── */
 export function ContractGeneratePage() {
   const serverUrl = useSettingsStore((s) => s.serverUrl)
   const modelConfig = useSettingsStore((s) => s.modelConfig)
   const settings = useMemo(() => ({ serverUrl, modelConfig }), [serverUrl, modelConfig])
 
-  const [messages, setMessages] = useState<GenMsg[]>([])
-  const [input, setInput] = useState('')
-  const [sending, setSending] = useState(false)
-  const [previewOpen, setPreviewOpen] = useState(false)
-  const [previewContract, setPreviewContract] = useState<ContractItem | null>(null)
-  const [sessionTitle, setSessionTitle] = useState<string | null>(null)
-  const [msgCount, setMsgCount] = useState(0)
+  // Sessions state
+  const [sessions, setSessions] = useState<Session[]>(() => {
+    const loaded = loadSessions()
+    if (loaded.length > 0) return loaded
+    const first = makeSession()
+    return [first]
+  })
+  const [activeSessionId, setActiveSessionId] = useState<string>(() => {
+    const saved = localStorage.getItem(ACTIVE_KEY)
+    const loaded = loadSessions()
+    if (saved && loaded.find((s) => s.id === saved)) return saved
+    return loaded[0]?.id ?? makeSession().id
+  })
 
-  const scrollerRef = useRef<HTMLDivElement>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const activeSession = sessions.find((s) => s.id === activeSessionId) ?? sessions[0]
+
+  // Per-session UI state derived from active session
+  const [messages, setMessages]             = useState<GenMsg[]>(activeSession?.messages ?? [])
+  const [previewOpen, setPreviewOpen]       = useState(false)
+  const [previewContract, setPreviewContract] = useState<ContractItem | null>(null)
+
+  // Transient UI state
+  const [input, setInput]   = useState('')
+  const [sending, setSending] = useState(false)
+
+  const scrollerRef  = useRef<HTMLDivElement>(null)
+  const textareaRef  = useRef<HTMLTextAreaElement>(null)
 
   const scrollToBottom = () => {
     const el = scrollerRef.current
@@ -424,14 +586,76 @@ export function ContractGeneratePage() {
 
   useEffect(() => { scrollToBottom() }, [messages])
 
+  // Persist sessions whenever they change
+  useEffect(() => { saveSessions(sessions) }, [sessions])
+
+  // Persist active session id
+  useEffect(() => {
+    localStorage.setItem(ACTIVE_KEY, activeSessionId)
+  }, [activeSessionId])
+
+  // Save current messages back into the active session
+  const flushMessages = (msgs: GenMsg[], contractId?: string | null) => {
+    setSessions((prev) => prev.map((s) => {
+      if (s.id !== activeSessionId) return s
+      const userMsgs = msgs.filter((m): m is UserMsg => m.kind === 'user')
+      const title = userMsgs[0]?.text.slice(0, 20) + (userMsgs[0]?.text.length > 20 ? '…' : '') || s.title
+      return {
+        ...s,
+        title: title || s.title,
+        messages: msgs,
+        previewContractId: contractId !== undefined ? contractId : s.previewContractId,
+        updatedAt: Date.now(),
+      }
+    }))
+  }
+
+  // Switch session
+  const switchSession = (id: string) => {
+    // Save current session first
+    flushMessages(messages)
+
+    const target = sessions.find((s) => s.id === id)
+    if (!target) return
+    setActiveSessionId(id)
+    setMessages(target.messages)
+    setPreviewOpen(false)
+    setPreviewContract(null)
+    setInput('')
+  }
+
+  // New session
   const newSession = () => {
+    flushMessages(messages)
+    const s = makeSession()
+    setSessions((prev) => [s, ...prev])
+    setActiveSessionId(s.id)
     setMessages([])
     setPreviewOpen(false)
     setPreviewContract(null)
-    setSessionTitle(null)
-    setMsgCount(0)
     setInput('')
     textareaRef.current?.focus()
+  }
+
+  // Delete session
+  const deleteSession = (id: string) => {
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.id !== id)
+      if (next.length === 0) {
+        const fresh = makeSession()
+        return [fresh]
+      }
+      return next
+    })
+    // If deleting active, switch to first remaining
+    if (id === activeSessionId) {
+      const remaining = sessions.filter((s) => s.id !== id)
+      const target = remaining[0] ?? makeSession()
+      setActiveSessionId(target.id)
+      setMessages(target.messages ?? [])
+      setPreviewOpen(false)
+      setPreviewContract(null)
+    }
   }
 
   const openPreview = (contract: ContractItem) => {
@@ -445,16 +669,13 @@ export function ContractGeneratePage() {
     setInput('')
     setSending(true)
 
-    setMsgCount((c) => c + 1)
-    if (!sessionTitle) setSessionTitle(text.slice(0, 24) + (text.length > 24 ? '…' : ''))
-
-    // Add user message + live steps card
     const steps: StepState[] = INITIAL_STEPS.map((s) => ({ ...s }))
-    setMessages((prev) => [
-      ...prev,
+    const nextMessages: GenMsg[] = [
+      ...messages,
       { kind: 'user', text },
       { kind: 'steps', steps: [...steps] },
-    ])
+    ]
+    setMessages(nextMessages)
     scrollToBottom()
 
     const updateStep = (key: string, status: StepStatus, detail?: string) => {
@@ -509,20 +730,24 @@ export function ContractGeneratePage() {
             setMessages((prev) => {
               const withoutSteps = prev.filter((m) => m.kind !== 'steps')
               const fieldCount = Object.keys(contract.extracted_fields).filter((k) => k !== 'raw_order').length
-              return [
+              const finalMsgs: GenMsg[] = [
                 ...withoutSteps,
                 { kind: 'steps', steps: steps.map((s) => ({ ...s, status: s.status === 'pending' ? 'done' as StepStatus : s.status })) },
                 { kind: 'extracted', fields: contract.extracted_fields },
                 { kind: 'ai', text: `合同已生成完成 ✓  共识别 ${fieldCount} 个字段、引用 ${contract.laws_used.length} 部法律条文，校验通过。点击下方文件卡片在右侧预览，确认后可导出。` },
                 { kind: 'file', contract },
               ]
+              flushMessages(finalMsgs, contract.id)
+              return finalMsgs
             })
             setPreviewContract(contract)
             setPreviewOpen(true)
           } else if (event.type === 'error') {
             setMessages((prev) => {
               const withoutSteps = prev.filter((m) => m.kind !== 'steps')
-              return [...withoutSteps, { kind: 'error', text: `生成失败：${String(event.message)}` }]
+              const finalMsgs: GenMsg[] = [...withoutSteps, { kind: 'error', text: `生成失败：${String(event.message)}` }]
+              flushMessages(finalMsgs)
+              return finalMsgs
             })
           }
         }
@@ -530,7 +755,9 @@ export function ContractGeneratePage() {
     } catch (e) {
       setMessages((prev) => {
         const withoutSteps = prev.filter((m) => m.kind !== 'steps')
-        return [...withoutSteps, { kind: 'error', text: `生成失败：${String(e)}` }]
+        const finalMsgs: GenMsg[] = [...withoutSteps, { kind: 'error', text: `生成失败：${String(e)}` }]
+        flushMessages(finalMsgs)
+        return finalMsgs
       })
     } finally {
       setSending(false)
@@ -546,9 +773,20 @@ export function ContractGeneratePage() {
   }
 
   const isEmpty = messages.length === 0
+  const sessionTitle = activeSession?.title ?? '合同生成'
+  const msgCount = messages.filter((m) => m.kind === 'user').length
 
   return (
     <div style={{ display: 'flex', flex: 1, minHeight: 0, height: '100%', overflow: 'hidden' }}>
+
+      {/* ── Sessions Panel ── */}
+      <SessionsPanel
+        sessions={sessions}
+        activeId={activeSessionId}
+        onSelect={switchSession}
+        onNew={newSession}
+        onDelete={deleteSession}
+      />
 
       {/* ── Chat column ── */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--gray-50)' }}>
@@ -556,7 +794,7 @@ export function ContractGeneratePage() {
         {/* Context bar */}
         <div className="topic-bar">
           <div>
-            <div className="topic-title">{sessionTitle ?? '合同生成'}</div>
+            <div className="topic-title">{sessionTitle}</div>
             <div className="topic-meta">
               {msgCount > 0
                 ? <span>{msgCount} 条消息 · 粘贴订单信息，AI 自动识别字段并起草合同</span>
@@ -576,7 +814,18 @@ export function ContractGeneratePage() {
             <button type="button" className="btn-sm" onClick={newSession}>
               <Plus size={13} /> 新建会话
             </button>
-            <button type="button" className="icon-btn" title="复制会话" onClick={() => { if (messages.length) navigator.clipboard.writeText(messages.filter(m => m.kind === 'user').map(m => (m as UserMsg).text).join('\n')) }}>
+            <button
+              type="button"
+              className="icon-btn"
+              title="复制会话内容"
+              onClick={() => {
+                if (messages.length) {
+                  navigator.clipboard.writeText(
+                    messages.filter((m): m is UserMsg => m.kind === 'user').map((m) => m.text).join('\n')
+                  )
+                }
+              }}
+            >
               <Copy size={14} />
             </button>
           </div>

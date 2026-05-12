@@ -10,15 +10,24 @@ import { TemplateManagerPage } from './pages/TemplateManager'
 import { useSettingsStore } from './store/settings'
 import type { HealthResponse } from './types'
 
-function renderTab(tab: AppTab) {
-  switch (tab) {
-    case 'contracts': return <ContractGeneratePage />
-    case 'templates': return <TemplateManagerPage />
-    case 'laws':      return <LawLibraryPage />
-    case 'chat':      return <ChatPage />
-    case 'settings':  return <SettingsPage />
-    default:          return null
-  }
+function TabPages({ activeTab }: { activeTab: AppTab }) {
+  const tabs: AppTab[] = ['chat', 'contracts', 'templates', 'laws', 'settings']
+  return (
+    <>
+      {tabs.map((tab) => (
+        <div
+          key={tab}
+          style={{ display: activeTab === tab ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}
+        >
+          {tab === 'contracts' && <ContractGeneratePage />}
+          {tab === 'templates' && <TemplateManagerPage />}
+          {tab === 'laws'      && <LawLibraryPage />}
+          {tab === 'chat'      && <ChatPage />}
+          {tab === 'settings'  && <SettingsPage />}
+        </div>
+      ))}
+    </>
+  )
 }
 
 export default function App() {
@@ -97,7 +106,7 @@ export default function App() {
       version={version}
       connectionStatus={{ kind: healthKind, message: healthMsg }}
     >
-      {renderTab(tab)}
+      <TabPages activeTab={tab} />
     </AppShell>
   )
 }

@@ -234,7 +234,10 @@ class ContractService:
         template_source = await self._resolve_template_docx_path(db, contract)
         if template_source is not None:
             try:
-                self._render_contract_into_template(template_source, file_path, contract)
+                from app.services.docx_builder import DocxRenderer, FieldSubstitutor, TemplateAnalyzer
+                structure = TemplateAnalyzer().analyze(template_source)
+                filled = FieldSubstitutor().fill(structure, contract.extracted_fields)
+                DocxRenderer().render(filled, file_path)
                 return file_path
             except Exception:
                 pass
@@ -269,27 +272,10 @@ class ContractService:
         return file_path
 
     async def _extract_fields(self, order_input: str, model_config: ModelConfig) -> dict[str, str]:
-        ai_fields = await self.ai_service.extract_fields(order_input, model_config)
         fields: dict[str, str] = {"raw_order": order_input.strip()}
+        ai_fields = await self.ai_service.extract_fields(order_input, model_config)
         if ai_fields:
             fields.update(ai_fields)
-
-        nie_match = re.search(r"NIE[:\s]*([A-Z]\d{7}[A-Z])", order_input, re.IGNORECASE)
-        if nie_match:
-            fields["nie"] = nie_match.group(1).upper()
-
-        fee_match = re.search(r"(\d+[\.,]?\d*)\s*eu", order_input, re.IGNORECASE)
-        if fee_match:
-            fields["honorarios"] = fee_match.group(1)
-
-        service_match = re.search(r"服务[:：]\s*([^，,\n]+)|servicio[:\s]*([^，,\n]+)", order_input, re.IGNORECASE)
-        if service_match:
-            fields["tipo_servicio"] = next(group for group in service_match.groups() if group)
-
-        name_match = re.search(r"客户([^，,\n]+)|cliente[:\s]*([^，,\n]+)", order_input, re.IGNORECASE)
-        if name_match:
-            fields["nombre"] = next(group for group in name_match.groups() if group).strip()
-
         return fields
 
     async def _select_template(
@@ -301,7 +287,13 @@ class ContractService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active templates available")
 
         template_options = [
-            {"id": t.id, "title": t.title, "category": t.category or "", "subcategory": t.subcategory or ""}
+            {
+                "id": t.id,
+                "title": t.title,
+                "category": t.category or "",
+                "subcategory": t.subcategory or "",
+                "preview": (t.raw_text or "")[:800],
+            }
             for t in templates
         ]
         ai_id = await self.ai_service.select_template(order_input, template_options, model_config)
@@ -327,20 +319,8 @@ class ContractService:
         return template
 
     async def _resolve_laws(self, db: AsyncSession, order_input: str, model_config: ModelConfig) -> list[dict[str, str]]:
-        # Extract Latin-script words (5+ chars) as BOE search terms, skip common stopwords
-        _STOP = {"para", "como", "esta", "este", "sobre", "entre", "hasta", "desde", "todos", "todas"}
-        latin_tokens = [
-            w.lower() for w in re.findall(r"[a-zA-ZáéíóúñüÁÉÍÓÚÑÜ]{5,}", order_input)
-            if w.lower() not in _STOP
-        ]
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        search_terms: list[str] = []
-        for t in latin_tokens:
-            if t not in seen:
-                seen.add(t)
-                search_terms.append(t)
-        search_terms = search_terms[:4]
+        # AI generates Spanish BOE search terms (works for any input language)
+        search_terms = await self.ai_service.generate_search_terms(order_input, model_config)
 
         # Search BOE online for each term and fetch+cache results
         for term in search_terms:
@@ -375,16 +355,8 @@ class ContractService:
             if ai_laws:
                 return [{"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text or ""} for law in ai_laws[:5]]
 
-        # Fallback: keyword scoring
-        order_tokens = {w.lower() for w in re.findall(r"[a-zA-ZáéíóúñüÁÉÍÓÚÑÜ]{4,}", order_input)}
-        scored: list[tuple[int, CachedLaw]] = []
-        for law in all_laws:
-            haystack = " ".join(filter(None, [law.title, law.boe_id, law.category or ""])).lower()
-            score = sum(1 for token in order_tokens if token in haystack)
-            scored.append((score, law))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        relevant = [law for score, law in scored if score > 0] or [law for _, law in scored[:3]]
-        return [{"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text or ""} for law in relevant[:5]]
+        # Fallback: return top cached laws as-is
+        return [{"boe_id": law.boe_id, "title": law.title, "raw_text": law.raw_text or ""} for law in all_laws[:5]]
 
     async def _generate_contract_text(
         self,
@@ -399,7 +371,7 @@ class ContractService:
             order_input=order_input,
             extracted_fields=extracted_fields,
             template_title=template.title,
-            template_text=template.raw_text,
+            template_text=template.raw_text or "",
             laws=laws,
             model_config=model_config,
         )
@@ -416,27 +388,49 @@ class ContractService:
         template: ContractTemplate,
         laws: list[dict[str, str]],
     ) -> str:
-        customer = extracted_fields.get("nombre", "la parte cliente")
-        service_type = extracted_fields.get("tipo_servicio", template.title)
-        fee = extracted_fields.get("honorarios", "por determinar")
-        law_text = ", ".join(law["title"] for law in laws)
-        template_preview = (template.raw_text or "").splitlines()[:8]
-        preview = "\n".join(template_preview)
+        def get_field(*keys: str, default: str = "") -> str:
+            for k in keys:
+                v = extracted_fields.get(k)
+                if v and str(v).strip() and str(v).strip().lower() not in {"none", "null", "n/a"}:
+                    return str(v).strip()
+            return default
+
+        customer = get_field(
+            "nombre", "name", "cliente", "client", "nombre_cliente", "client_name",
+            "nombre_completo", "full_name", "apellidos", default="la parte cliente"
+        )
+        service_type = get_field(
+            "tipo_servicio", "service_type", "contract_type", "servicio", "tipo",
+            "service", "tipo_contrato", "objeto", default=template.title
+        )
+        fee = get_field(
+            "honorarios", "price", "precio", "fee", "importe", "tarifa",
+            "honorario", "coste", "cost", "amount", default="por determinar"
+        )
+        currency = get_field("currency", "moneda", default="EUR")
+        nie = get_field("nie", "nif", "dni", "id_number", default="")
+        nie_clause = f" (NIE/NIF: {nie})" if nie else ""
+
+        law_text = ", ".join(law["title"] for law in laws) if laws else "normativa española aplicable"
 
         return (
             f"{title or template.title}\n\n"
             f"PRIMERA. Partes\n"
-            f"Entre el despacho profesional y {customer}, con los datos aportados en el pedido, se formaliza la presente hoja de encargo.\n\n"
+            f"Entre el despacho profesional y {customer}{nie_clause}, con los datos aportados en el pedido, "
+            f"se formaliza la presente hoja de encargo profesional.\n\n"
             f"SEGUNDA. Objeto\n"
-            f"El servicio contratado corresponde a {service_type}. El contenido inicial del pedido es: {order_input.strip()}.\n\n"
-            f"TERCERA. Base documental\n"
-            f"Se toma como referencia la plantilla '{template.title}' y la normativa siguiente: {law_text}.\n\n"
-            f"CUARTA. Honorarios\n"
-            f"Los honorarios profesionales pactados ascienden a {fee} EUR, salvo ajuste posterior por acuerdo escrito entre las partes.\n\n"
-            f"QUINTA. Clausulas operativas\n"
-            f"La parte cliente se compromete a facilitar documentacion veraz y completa. El despacho ejecutara las actuaciones necesarias con diligencia profesional.\n\n"
-            f"SEXTA. Referencia de plantilla\n"
-            f"Extracto inicial de la plantilla usada:\n{preview}"
+            f"El servicio contratado es: {service_type}.\n\n"
+            f"TERCERA. Honorarios\n"
+            f"Los honorarios profesionales pactados ascienden a {fee} {currency}, "
+            f"salvo ajuste posterior por acuerdo escrito entre las partes.\n\n"
+            f"CUARTA. Obligaciones de las Partes\n"
+            f"La parte cliente se compromete a facilitar documentacion veraz y completa. "
+            f"El despacho ejecutara las actuaciones necesarias con diligencia profesional.\n\n"
+            f"QUINTA. Normativa Aplicable\n"
+            f"El presente contrato se rige por: {law_text}.\n\n"
+            f"SEXTA. Jurisdiccion\n"
+            f"Las partes se someten a los juzgados y tribunales de Madrid para la resolucion de cualquier controversia.\n\n"
+            f"Datos del pedido original:\n{order_input.strip()}"
         )
 
     def _validate_contract(self, generated_text: str) -> None:

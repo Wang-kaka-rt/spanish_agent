@@ -60,6 +60,19 @@ export const api = {
     const { data } = await client.get<TemplateItem>(`/templates/${templateId}`)
     return data
   },
+  async getTemplateFile(settings: AppSettings, templateId: string): Promise<Blob> {
+    const { data } = await axios.get(`${settings.serverUrl}/api/templates/${templateId}/file`, {
+      responseType: 'blob',
+      headers: {
+        'X-Model-Provider': settings.modelConfig.provider,
+        'X-Model-Id': settings.modelConfig.modelId,
+        'X-Model-Base-Url': settings.modelConfig.baseUrl,
+        'X-Model-Api-Key': settings.modelConfig.apiKey,
+        'X-Model-Temperature': String(settings.modelConfig.temperature)
+      }
+    })
+    return data
+  },
   async searchBoe(settings: AppSettings, query: string) {
     const client = createClient(settings)
     const { data } = await client.get<Array<{ boe_id: string; title: string; source_url?: string }>>('/laws/boe/search', {

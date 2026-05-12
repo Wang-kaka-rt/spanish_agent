@@ -13,18 +13,42 @@ MODEL_REQUEST_TIMEOUT_SECONDS = 180.0
 class AIService:
     async def extract_fields(self, order_input: str, model_config: ModelConfig) -> dict[str, str] | None:
         system_prompt = (
-            "You extract structured contract order fields. "
-            "Return JSON only. Keys can include nombre, nie, tipo_servicio, honorarios, fecha, telefono, email."
+            "You are a contract order analyst. Read the order text carefully and extract every meaningful piece of "
+            "information as a flat JSON object. Use descriptive keys in Spanish or English as appropriate. "
+            "Do not restrict yourself to any predefined set of keys — capture whatever the order contains. "
+            "Return strict JSON only, no explanation."
         )
         user_prompt = (
-            "Extract the relevant fields from the following contract order text and return strict JSON.\n\n"
+            "Extract all relevant fields from the following contract order text and return strict JSON.\n\n"
             f"{order_input}"
         )
-        response_text = await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=500)
+        response_text = await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=800)
         if not response_text:
             return None
 
         return self._parse_json_object(response_text)
+
+    async def generate_search_terms(self, order_input: str, model_config: ModelConfig) -> list[str]:
+        """Generate 3-4 Spanish BOE search terms from order text in any language."""
+        system_prompt = (
+            "You are a Spanish legal assistant. Based on the contract order, generate 3 to 4 concise Spanish "
+            "legal search terms suitable for searching the BOE (Boletín Oficial del Estado). "
+            "Each term should be a short phrase or legal concept in Spanish. Return strict JSON only: "
+            '{"terms": ["term1", "term2", ...]}'
+        )
+        user_prompt = (
+            f"Contract order:\n{order_input}\n\n"
+            "Generate 3-4 Spanish BOE search terms for this order."
+        )
+        response_text = await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=200)
+        if not response_text:
+            return []
+        data = self._parse_json_raw(response_text)
+        if isinstance(data, dict):
+            terms = data.get("terms", [])
+            if isinstance(terms, list):
+                return [str(t) for t in terms if t][:4]
+        return []
 
     async def generate_contract(
         self,
@@ -38,33 +62,41 @@ class AIService:
         law_context = "\n\n".join(
             f"- {law['title']} ({law['boe_id']}):\n{law.get('raw_text', '')[:1800]}" for law in laws
         )
+        # Pass more template content when available; cap at 6000 chars to stay within context
+        template_excerpt = (template_text or "").strip()[:6000]
+        has_template = bool(template_excerpt)
+
         system_prompt = (
             "You are a Spanish legal contract drafting assistant. "
-            "Draft a complete hoja de encargo in Spanish using the selected template only as a reference for structure, "
-            "tone, section ordering, and clause style. The final contract must be newly drafted from the order data and "
-            "the provided legal materials. Never copy personal data, company data, IDs, addresses, phones, emails, or "
-            "sample facts from the template unless they also appear in the extracted order fields. If the template "
-            "contains sample names or example clauses, treat them as examples only and replace them with the actual "
-            "order facts. Preserve the template's overall document rhythm as much as possible, including the high-level "
-            "order of introductory headings and the sequence of clauses, while rewriting the substance for the current "
-            "matter. Produce a formal, practical, standalone Spanish contract with clear sections such as PRIMERA, "
-            "SEGUNDA, TERCERA, CUARTA and QUINTA."
+            "Your task is to produce a complete, formal Spanish hoja de encargo (engagement letter / contract). "
+            "CRITICAL RULE: If a template is provided, you MUST reproduce its EXACT heading structure, "
+            "clause numbering, and section order. Do NOT change clause titles or their sequence. "
+            "Only replace sample/placeholder values (names, NIE numbers, dates, fees, addresses, phone numbers) "
+            "with the actual values from the order. Boilerplate clauses that do not contain variable data should "
+            "be kept verbatim or near-verbatim. "
+            "If a field from the order is not found in the template structure, append it in a new clause at the end. "
+            "If NO template is provided, draft a standard hoja de encargo with sections: "
+            "PRIMERA (Partes), SEGUNDA (Objeto), TERCERA (Honorarios), CUARTA (Obligaciones), QUINTA (Jurisdicción). "
+            "Never invent specific IDs, registration numbers, or contact details not present in the order."
         )
         user_prompt = (
-            f"Order input:\n{order_input}\n\n"
-            f"Extracted fields:\n{json.dumps(extracted_fields, ensure_ascii=True, indent=2)}\n\n"
-            f"Selected template title:\n{template_title}\n\n"
-            f"Selected template text:\n{template_text[:4000]}\n\n"
-            f"Relevant laws:\n{law_context[:5000]}\n\n"
-            "Instructions:\n"
-            "- Use the template as a style and structure reference, not as data to copy.\n"
-            "- Use the extracted fields and order input as the authoritative source of party data and service details.\n"
-            "- If some information is missing, write neutral professional wording and avoid inventing specific IDs, "
-            "addresses, emails, phone numbers, registration numbers, or names.\n"
-            "- Incorporate the legal context where useful, but do not quote long raw law passages unless necessary.\n"
-            "- Return only the final Spanish contract text.\n"
+            f"=== ORDER INPUT ===\n{order_input}\n\n"
+            f"=== EXTRACTED FIELDS ===\n{json.dumps(extracted_fields, ensure_ascii=False, indent=2)}\n\n"
+            f"=== TEMPLATE TITLE ===\n{template_title}\n\n"
         )
-        return await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=2200)
+        if has_template:
+            user_prompt += (
+                f"=== TEMPLATE TEXT (reproduce this structure exactly) ===\n{template_excerpt}\n\n"
+            )
+        if law_context.strip():
+            user_prompt += f"=== RELEVANT LAWS ===\n{law_context[:4000]}\n\n"
+        user_prompt += (
+            "Now produce the final Spanish contract. "
+            "Follow the template structure exactly. "
+            "Replace sample values with real order data. "
+            "Output ONLY the contract text, no explanation.\n"
+        )
+        return await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=3000)
 
     async def answer_question(
         self,
@@ -77,14 +109,15 @@ class AIService:
             f"- {law['title']} ({law['boe_id']}):\n{law.get('raw_text', '')[:1200]}" for law in laws
         )
         system_prompt = (
-            "You are a legal assistant for Spanish immigration and contract work. "
-            "Answer in Spanish, be practical, and mention uncertainty when needed."
+            "You are a legal assistant specializing in Spanish immigration law and contract work. "
+            "Always reply in the same language the user writes in. "
+            "Be practical and mention uncertainty when needed."
         )
         user_prompt = (
             f"Question:\n{question}\n\n"
             f"Available template summaries:\n{json.dumps(template_summaries, ensure_ascii=True, indent=2)}\n\n"
             f"Available law cache:\n{law_context[:4000]}\n\n"
-            "Provide a concise but useful answer in Spanish."
+            "Provide a concise but useful answer."
         )
         return await self._complete_text(model_config, system_prompt, user_prompt, max_tokens=1200)
 
@@ -99,14 +132,15 @@ class AIService:
             f"- {law['title']} ({law['boe_id']}):\n{law.get('raw_text', '')[:1200]}" for law in laws
         )
         system_prompt = (
-            "You are a legal assistant for Spanish immigration and contract work. "
-            "Answer in Spanish, be practical, and mention uncertainty when needed."
+            "You are a legal assistant specializing in Spanish immigration law and contract work. "
+            "Always reply in the same language the user writes in. "
+            "Be practical and mention uncertainty when needed."
         )
         user_prompt = (
             f"Question:\n{question}\n\n"
             f"Available template summaries:\n{json.dumps(template_summaries, ensure_ascii=True, indent=2)}\n\n"
             f"Available law cache:\n{law_context[:4000]}\n\n"
-            "Provide a concise but useful answer in Spanish."
+            "Provide a concise but useful answer."
         )
 
         provider = (model_config.provider or "").strip().lower()
@@ -188,7 +222,7 @@ class AIService:
             "anthropic-version": "2023-06-01",
         }
         payload = {
-            "model": model_config.model_id or "claude-3-5-sonnet-20241022",
+            "model": model_config.model_id or "claude-opus-4-7",
             "max_tokens": max_tokens,
             "temperature": model_config.temperature,
             "system": system_prompt,
@@ -261,7 +295,7 @@ class AIService:
             "anthropic-version": "2023-06-01",
         }
         payload = {
-            "model": model_config.model_id or "claude-3-5-sonnet-20241022",
+            "model": model_config.model_id or "claude-opus-4-7",
             "max_tokens": max_tokens,
             "temperature": model_config.temperature,
             "system": system_prompt,
@@ -295,7 +329,7 @@ class AIService:
                 "anthropic-version": "2023-06-01",
             }
             payload = {
-                "model": model_config.model_id or "claude-3-5-sonnet-20241022",
+                "model": model_config.model_id or "claude-opus-4-7",
                 "max_tokens": 10,
                 "temperature": 0,
                 "system": system_prompt,
@@ -382,12 +416,12 @@ class AIService:
     ) -> str | None:
         """Return the template_id best matching the order, or None on failure."""
         options = "\n".join(
-            f"- id:{t['id']} | title:{t['title']} | category:{t.get('category', '')} | sub:{t.get('subcategory', '')}"
+            f"- id:{t['id']} | title:{t['title']} | category:{t.get('category', '')} | sub:{t.get('subcategory', '')} | preview:{t.get('preview', '')}"
             for t in templates
         )
         system_prompt = (
             "You are a Spanish legal assistant. Select the single most appropriate contract template "
-            "for the given order. Return strict JSON only."
+            "for the given order based on the template title, category, and content preview. Return strict JSON only."
         )
         user_prompt = (
             f"Order:\n{order_input}\n\n"

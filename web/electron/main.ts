@@ -6,7 +6,7 @@ const defaultModelConfig = {
   provider: 'anthropic',
   apiKey: '',
   baseUrl: '',
-  modelId: 'claude-opus-4-1',
+  modelId: 'claude-opus-4-7',
   temperature: 0.1
 }
 

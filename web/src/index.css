@@ -667,6 +667,8 @@ textarea { resize: none; line-height: 1.6; }
 .session-item-date { font-size: 10.5px; color: var(--gray-400); flex-shrink: 0; }
 .session-item-preview { font-size: 12px; color: var(--gray-500); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sessions-footer { border-top: 1px solid var(--gray-200); padding: 10px 16px; font-size: 11.5px; color: var(--gray-500); display: flex; align-items: center; gap: 8px; }
+.session-item-del { color: var(--gray-400) !important; }
+.session-item-del:hover { color: var(--red-600) !important; }
 
 /* ============================================================
    TEMPLATES TABLE
